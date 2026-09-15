@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cinttypes>
+
 void llama_model_k2_horizon::load_arch_hparams(llama_model_loader & ml) {
     // generic
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -7,6 +9,15 @@ void llama_model_k2_horizon::load_arch_hparams(llama_model_loader & ml) {
 
     hparams.f_norm_group_eps = hparams.f_norm_rms_eps;
     if (hparams.n_norm_groups == 0) hparams.n_norm_groups = 1;
+
+    if (hparams.n_norm_groups > hparams.n_embd ||
+        hparams.n_embd % hparams.n_norm_groups != 0) {
+        throw std::runtime_error(format(
+            "invalid normalization group count: %u for embedding length %u",
+            hparams.n_norm_groups,
+            hparams.n_embd
+        ));
+    }
     
     // moe
     if (hparams.n_expert > 0) {
@@ -21,18 +32,42 @@ void llama_model_k2_horizon::load_arch_hparams(llama_model_loader & ml) {
         if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
             hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
         }
+        if (hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX &&
+            hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID) {
+            throw std::runtime_error(format(
+                "unsupported expert gating function: %u",
+                hparams.expert_gating_func
+            ));
+        }
     }
 
     // mova
     ml.get_key(LLM_KV_ATTENTION_VALUE_EXPERT_COUNT, hparams.n_value_expert, false);
     ml.get_key(LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT, hparams.n_value_expert_used, false);
     if (hparams.n_value_expert > 0) {
-        GGML_ASSERT(hparams.n_value_expert <= LLAMA_MAX_EXPERTS);
-        GGML_ASSERT(hparams.n_value_expert_used > 0);
-        GGML_ASSERT(hparams.n_value_expert_used <= hparams.n_value_expert);
+        if (hparams.n_expert == 0) {
+            throw std::runtime_error("K2 Horizon value experts require MoE layers");
+        }
+        if (hparams.n_value_expert > LLAMA_MAX_EXPERTS) {
+            throw std::runtime_error(format(
+                "value expert count exceeds the maximum: %u",
+                hparams.n_value_expert
+            ));
+        }
+        if (hparams.n_value_expert_used == 0 ||
+            hparams.n_value_expert_used > hparams.n_value_expert) {
+            throw std::runtime_error(format(
+                "invalid value expert used count: %u of %u",
+                hparams.n_value_expert_used,
+                hparams.n_value_expert
+            ));
+        }
     }
-    else {
-        GGML_ASSERT(hparams.n_value_expert_used == 0);
+    else if (hparams.n_value_expert_used != 0) {
+        throw std::runtime_error(format(
+            "value expert used count is set without value experts: %u",
+            hparams.n_value_expert_used
+        ));
     }
 
     // model size info
@@ -256,8 +291,13 @@ static ggml_tensor * k2_horizon_group_rms_norm(
     int64_t n_groups,
     float eps
 ) {
-    GGML_ASSERT(n_groups > 0);
-    GGML_ASSERT(cur->ne[0] % n_groups == 0);
+    if (n_groups <= 0 || cur->ne[0] % n_groups != 0) {
+        throw std::runtime_error(format(
+            "invalid normalization group count: %" PRId64 " for tensor width %" PRId64,
+            n_groups,
+            cur->ne[0]
+        ));
+    }
 
     const int64_t n_embd = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
@@ -296,10 +336,11 @@ ggml_tensor * llama_model_k2_horizon::graph::build_routed_value(
     const int64_t n_values   = hparams.n_value_expert;
     const int64_t n_used     = hparams.n_value_expert_used;
 
-    GGML_ASSERT(layer.attn_v_gate != nullptr);
-    GGML_ASSERT(layer.attn_v_exps != nullptr);
-    GGML_ASSERT(n_values > 0);
-    GGML_ASSERT(n_used > 0);
+    if (layer.attn_v_gate == nullptr || layer.attn_v_exps == nullptr ||
+        n_values <= 0 || n_values > LLAMA_MAX_EXPERTS ||
+        n_used <= 0 || n_used > n_values) {
+        throw std::runtime_error("invalid K2 Horizon value expert configuration");
+    }
 
     // router. logits and probs
     ggml_tensor * logits = build_lora_mm(layer.attn_v_gate, cur);
@@ -315,7 +356,10 @@ ggml_tensor * llama_model_k2_horizon::graph::build_routed_value(
             probs = ggml_sigmoid(ctx0, logits);
             break;
         default:
-            GGML_ABORT("Unsupported K2 Horizon value-router gating function");
+            throw std::runtime_error(format(
+                "unsupported K2 Horizon value-router gating function: %u",
+                hparams.expert_gating_func
+            ));
     }
 
     // selection probs
@@ -383,8 +427,14 @@ llama_model_k2_horizon::graph::graph(
     const llama_model & model,
     const llm_graph_params & params
 ) : llm_graph_context(params) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    const uint32_t n_embd_head = hparams.n_embd_head_v();
+    if (n_embd_head != hparams.n_embd_head_k()) {
+        throw std::runtime_error(format(
+            "K2 Horizon requires equal key and value head dimensions: %u and %u",
+            hparams.n_embd_head_k(),
+            n_embd_head
+        ));
+    }
     
     // initialization or placeholders for computational artifacts
     ggml_tensor * cur;

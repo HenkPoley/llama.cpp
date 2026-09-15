@@ -341,6 +341,72 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     return ret;
 }
 
+static void test_k2_horizon_metadata_validation() {
+    struct test_case {
+        const char * name;
+        std::vector<std::pair<llm_kv, uint32_t>> metadata;
+    };
+
+    const test_case test_cases[] = {
+        {
+            "value expert count",
+            {
+                { LLM_KV_ATTENTION_VALUE_EXPERT_COUNT, 1 },
+                { LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT, 2 },
+            },
+        },
+        {
+            "value expert used count",
+            {
+                { LLM_KV_ATTENTION_VALUE_EXPERT_COUNT, 0 },
+                { LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT, 1 },
+            },
+        },
+        {
+            "normalization group count",
+            {
+                { LLM_KV_ATTENTION_GROUPNORM_GROUPS, 257 },
+            },
+        },
+        {
+            "expert gating function",
+            {
+                { LLM_KV_EXPERT_GATING_FUNC, 99 },
+            },
+        },
+    };
+
+    {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_K2_HORIZON, true);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.no_alloc = true;
+        size_t seed = 1;
+        llama_model_ptr model(llama_model_init_from_user(
+            gguf_ctx.get(), set_tensor_data, &seed, model_params));
+        if (!model) {
+            throw std::runtime_error("K2 Horizon validation fixture could not load valid metadata");
+        }
+    }
+
+    for (const auto & test : test_cases) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_K2_HORIZON, true);
+        llama_model_saver saver(LLM_ARCH_K2_HORIZON, gguf_ctx.get());
+        for (const auto & metadata : test.metadata) {
+            saver.add_kv(metadata.first, metadata.second);
+        }
+
+        llama_model_params model_params = llama_model_default_params();
+        model_params.no_alloc = true;
+        size_t seed = 1;
+        llama_model_ptr model(llama_model_init_from_user(
+            gguf_ctx.get(), set_tensor_data, &seed, model_params));
+        if (model) {
+            throw std::runtime_error(
+                std::string("K2 Horizon accepted invalid metadata: ") + test.name);
+        }
+    }
+}
+
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
     return true;
 }
@@ -807,6 +873,9 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_K2_HORIZON) {
+            test_k2_horizon_metadata_validation();
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {
