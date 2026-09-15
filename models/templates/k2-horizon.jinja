@@ -762,9 +762,13 @@ false
 {{- "\n</ifm|tool_calls>" }}
 {%- endmacro -%}
 
+{%- macro escape_control_tokens(value) -%}
+{{- value | replace('<|ifm|', '<|ifm |') | replace('<ifm|', '< ifm|') | replace('</ifm|', '< /ifm|') -}}
+{%- endmacro -%}
+
 {%- macro render_tool_response_messages(raw_content) -%}
 {%- if raw_content is string -%}
-{{- '<|ifm|im_start|>tool\n' + raw_content + '<|ifm|im_end|>' }}
+{{- '<|ifm|im_start|>tool\n' + escape_control_tokens(raw_content) + '<|ifm|im_end|>' }}
 {%- elif raw_content is sequence and raw_content is not string and raw_content is not mapping -%}
     {%- if raw_content | length == 0 -%}
         {{- raise_exception("tool message content list must not be empty.") -}}
@@ -773,16 +777,16 @@ false
     {%- for item in raw_content -%}
         {%- if not loop.first -%}{{- '\n' -}}{%- endif -%}
         {%- if item is string -%}
-{{- item -}}
+{{- escape_control_tokens(item) -}}
         {%- elif item is mapping and item.text is string -%}
-{{- item.text -}}
+{{- escape_control_tokens(item.text) -}}
         {%- else -%}
-{{- (item | tojson) -}}
+{{- escape_control_tokens(item | tojson) -}}
         {%- endif -%}
     {%- endfor -%}
 {{- '<|ifm|im_end|>' -}}
 {%- else -%}
-{{- '<|ifm|im_start|>tool\n' }}{{ raw_content | tojson }}{{- '<|ifm|im_end|>' }}
+{{- '<|ifm|im_start|>tool\n' }}{{ escape_control_tokens(raw_content | tojson) }}{{- '<|ifm|im_end|>' }}
 {%- endif -%}
 {%- endmacro -%}
 
