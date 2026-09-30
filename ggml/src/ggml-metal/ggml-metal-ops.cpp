@@ -3713,7 +3713,14 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         } else {
             nwg = 32;
             nsg = 1;
-            while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) {
+
+            // Speculative decoding inflates ne11 with later query rows' own KV entries,
+            // which can change nsg and its floating-point reduction order.
+            // Tuning from row 0's real KV length instead, keeps row 0 bitwise-consistent
+            // with a single-token decode.
+            const int64_t n_kv_row0 = ne11 - (ne01 - 1); // KV entries row 0 attends to
+
+            while (2*nwg*nsg*ncpsg < n_kv_row0 && nsg < 4) {
                 nsg *= 2;
             }
         }
